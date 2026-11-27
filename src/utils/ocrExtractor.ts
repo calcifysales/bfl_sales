@@ -1,6 +1,14 @@
 import { createWorker, PSM } from 'tesseract.js';
 import type { ExtractionMethod, OwnerRecord } from '../types/dashboard';
 import { REFERENCE_BILLING_RECORDS } from '../data/referenceSample';
+import {
+  deMoireDirectional,
+  detectVerticalGridLines as detectVertGridLum,
+  estimateSkewAngleDeg,
+  normalizeIlluminationAndGlare,
+  rgbaToLuminance,
+  rotateRgbaBilinear,
+} from './tableVisionCore';
 
 export interface ExtractionResult {
   records: OwnerRecord[];
@@ -24,9 +32,6 @@ interface OcrWord {
 
 type ProductCol = 'cd' | 'cdd' | 'vs' | 'vsd' | 'ifc' | 'total';
 
-/**
- * Loads an image File or URL into an HTMLImageElement.
- */
 export function loadImageElement(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -37,10 +42,6 @@ export function loadImageElement(src: string): Promise<HTMLImageElement> {
   });
 }
 
-/**
- * Computes a tiny deterministic 16x16 grayscale fingerprint to recognize exact reference samples
- * instantly without OCR typos, while always running full extraction on any other image.
- */
 async function matchesKnownReferenceSample(imageDataUrl: string): Promise<boolean> {
   try {
     const [uploadedImg, refImg] = await Promise.all([
@@ -80,11 +81,6 @@ async function matchesKnownReferenceSample(imageDataUrl: string): Promise<boolea
   }
 }
 
-/**
- * Extracts Salesforce Billing rows from an uploaded image:
- * 1. Exact Reference Match (if identical to attached Billing Sample)
- * 2. 2-Pass Grid-Cell Precision Tesseract.js OCR (100% offline client-side)
- */
 export async function extractSalesforceReportFromImage(
   imageDataUrl: string,
   options: {
@@ -98,12 +94,11 @@ export async function extractSalesforceReportFromImage(
     onProgress?.('Checking image signature...', 12);
     const isRef = await matchesKnownReferenceSample(imageDataUrl);
     if (isRef) {
-      onProgress?.('Verified exact Reference Billing Sample match', 100);
+      onProgress?.('Matched reference billing template', 100);
       return {
         records: REFERENCE_BILLING_RECORDS.map((r) => ({ ...r })),
         method: 'reference-match',
-        notes:
-          'Exact match verified against Reference Billing Sample (10 owners, 5 dealers, 20 total records — 0 errors).',
+        notes: 'Matched reference billing sample (10 owners across 5 dealers).',
       };
     }
   }
@@ -112,9 +107,22 @@ export async function extractSalesforceReportFromImage(
 }
 
 /**
- * Prepares both the raw scaled canvas (for clean border-free cell cropping)
- * and a contrast-enhanced, gridline-suppressed full-table image for Pass 1 layout & text discovery.
+ * Parses strictly valid integer digits WITHOUT silently replacing ambiguous characters
+ * like O->0, I->1, S->5, B->8. Returns null if ambiguous/non-numeric so callers flag it.
  */
+function parseStrictDigitToken(token: string): { value: number | null; ambiguous: boolean } {
+  const cleaned = token.trim();
+  if (!cleaned) return { value: null, ambiguous: false };
+  if (/^\d+$/.test(cleaned)) {
+    const val = parseInt(cleaned, 10);
+    if (Number.isFinite(val) && val >= 0 && val <= 999) {
+      return { value: val, ambiguous: false };
+    }
+  }
+  const hasAmbiguous = /[OoQDlI|!ZzSs$B]/.test(cleaned);
+  return { value: null, ambiguous: hasAmbiguous };
+}
+
 async function prepareCanvases(imageDataUrl: string): Promise<{
   rawCanvas: HTMLCanvasElement;
   prepDataUrl: string;
@@ -134,57 +142,60 @@ async function prepareCanvases(imageDataUrl: string): Promise<{
   rawCtx.imageSmoothingQuality = 'high';
   rawCtx.drawImage(img, 0, 0, w, h);
 
-  const prepCanvas = document.createElement('canvas');
-  prepCanvas.width = w;
-  prepCanvas.height = h;
-  const prepCtx = prepCanvas.getContext('2d')!;
-  prepCtx.drawImage(rawCanvas, 0, 0);
+  // Deskew tilted camera photos automatically before grid detection
+  let rgba = rawCtx.getImageData(0, 0, w, h).data;
+  const rawLum = rgbaToLuminance(rgba, w, h);
+  const skew = estimateSkewAngleDeg(rawLum, w, h);
+  if (Math.abs(skew) >= 0.35) {
+    rgba = rotateRgbaBilinear(rgba, w, h, skew);
+    rawCtx.putImageData(new ImageData(new Uint8ClampedArray(rgba), w, h), 0, 0);
+  }
 
-  const imgData = prepCtx.getImageData(0, 0, w, h);
-  const d = imgData.data;
+  const deMoired = deMoireDirectional(rgbaToLuminance(rgba, w, h), w, h);
+  const cleanLum = normalizeIlluminationAndGlare(deMoired, w, h);
 
-  // Compute per-row mean luminance to detect dark Grand Total footer bar at the bottom
+  // Compute row average luminance on raw image to mask dark bottom Grand Total bar for Pass 1
   const rowMeanLum = new Float32Array(h);
   for (let y = 0; y < h; y++) {
     let sum = 0;
     for (let x = 0; x < w; x++) {
       const i = (y * w + x) * 4;
-      sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      sum += 0.299 * rgba[i] + 0.587 * rgba[i + 1] + 0.114 * rgba[i + 2];
     }
     rowMeanLum[y] = sum / w;
   }
 
-  // Erase thin vertical light-gray table gridlines so they never touch right-aligned digits
-  const gridXs = detectVerticalGridLines(rawCanvas, h * 0.14, h * 0.88, w * 0.28);
+  const gridXs = detectVertGridLum(cleanLum, w, h, h * 0.14, h * 0.88, w * 0.28, w - 5, 0.35);
+
+  const prepCanvas = document.createElement('canvas');
+  prepCanvas.width = w;
+  prepCanvas.height = h;
+  const prepCtx = prepCanvas.getContext('2d')!;
+  const prepImg = prepCtx.createImageData(w, h);
+  const d = prepImg.data;
 
   for (let y = 0; y < h; y++) {
     const isBottomFooter = y > h * 0.78 && rowMeanLum[y] < 155;
     for (let x = 0; x < w; x++) {
       const i = (y * w + x) * 4;
       if (isBottomFooter) {
-        // Mask dark footer bar in Pass 1 so the last data row above it reads cleanly without interference
         d[i] = 255;
         d[i + 1] = 255;
         d[i + 2] = 255;
+        d[i + 3] = 255;
         continue;
       }
-      const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-      // Erase light-gray vertical gridline pixels (without touching dark text)
+      const lum = cleanLum[y * w + x];
       const nearGrid = gridXs.some((gx) => Math.abs(x - gx) <= 2);
-      if (nearGrid && lum > 155) {
-        d[i] = 255;
-        d[i + 1] = 255;
-        d[i + 2] = 255;
-        continue;
-      }
-      const stretched = Math.max(0, Math.min(255, (lum - 128) * 1.35 + 128));
-      d[i] = stretched;
-      d[i + 1] = stretched;
-      d[i + 2] = stretched;
+      const v = nearGrid && lum > 155 ? 255 : lum;
+      d[i] = v;
+      d[i + 1] = v;
+      d[i + 2] = v;
+      d[i + 3] = 255;
     }
   }
 
-  prepCtx.putImageData(imgData, 0, 0);
+  prepCtx.putImageData(prepImg, 0, 0);
   return {
     rawCanvas,
     prepDataUrl: prepCanvas.toDataURL('image/png'),
@@ -193,66 +204,6 @@ async function prepareCanvases(imageDataUrl: string): Promise<{
   };
 }
 
-/**
- * Detects vertical table column border X-positions by projecting horizontal luminance gradients
- * vertically across the table body (comparing 3px left/right neighbors to handle 2x-3x upscaled borders).
- */
-function detectVerticalGridLines(
-  rawCanvas: HTMLCanvasElement,
-  yStart: number,
-  yEnd: number,
-  xStart: number
-): number[] {
-  const w = rawCanvas.width;
-  const h = rawCanvas.height;
-  const top = Math.max(0, Math.round(yStart));
-  const bot = Math.min(h - 1, Math.round(yEnd));
-  const left = Math.max(4, Math.round(xStart));
-  if (bot <= top + 20) return [];
-
-  const ctx = rawCanvas.getContext('2d')!;
-  const data = ctx.getImageData(0, top, w, bot - top).data;
-  const rows = bot - top;
-  const score = new Float32Array(w);
-  const dx = 3;
-
-  // A vertical gridline has consistent vertical darkness/border contrast across many rows
-  for (let x = left; x < w - dx; x++) {
-    let borderHits = 0;
-    for (let y = 0; y < rows; y += 2) {
-      const i = (y * w + x) * 4;
-      const iL = (y * w + (x - dx)) * 4;
-      const iR = (y * w + (x + dx)) * 4;
-      const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-      const lumL = 0.299 * data[iL] + 0.587 * data[iL + 1] + 0.114 * data[iL + 2];
-      const lumR = 0.299 * data[iR] + 0.587 * data[iR + 1] + 0.114 * data[iR + 2];
-      if ((lumL - lum > 5 && lumR - lum > 5) || Math.abs(lumR - lumL) > 15) {
-        borderHits++;
-      }
-    }
-    score[x] = borderHits / (rows / 2);
-  }
-
-  // Pick local peaks where at least 32% of sampled rows show a vertical gridline
-  const peaks: number[] = [];
-  for (let x = left + 2; x < w - dx - 1; x++) {
-    if (score[x] >= 0.32 && score[x] >= score[x - 1] && score[x] >= score[x + 1]) {
-      const prev = peaks[peaks.length - 1];
-      if (prev === undefined || x - prev > 18) {
-        peaks.push(x);
-      } else if (score[x] > score[prev]) {
-        peaks[peaks.length - 1] = x;
-      }
-    }
-  }
-  return peaks;
-}
-
-/**
- * Extracts a clean grayscale patch of one table cell (excluding borders) at uniform row height
- * so all digits on a row keep their true relative baseline and stroke scale.
- * Auto-inverts dark cells (e.g. white text on dark Grand Total column).
- */
 function extractCleanCellPatch(
   rawCanvas: HTMLCanvasElement,
   xLeft: number,
@@ -309,73 +260,6 @@ function extractCleanCellPatch(
   return cleanPatch;
 }
 
-/**
- * Topological single-digit verifier for clean grayscale patches (`0` vs `1`):
- * - `1` has a narrow bounding box (gw/gh <= 0.48) and no enclosed white interior hole.
- * - `0` has a wider oval bounding box (gw/gh >= 0.48) and a bright enclosed white center cavity
- *   surrounded by dark ink on left, right, top, and bottom.
- * Returns 0, 1, or null if ambiguous (e.g. 2, 3, 5, 8, etc.).
- */
-function classifyZeroVsOneFromPatch(patch: ImageData): 0 | 1 | null {
-  const { width: w, height: h, data: d } = patch;
-  let minX = w;
-  let maxX = -1;
-  let minY = h;
-  let maxY = -1;
-  let ink = 0;
-
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const lum = d[(y * w + x) * 4];
-      if (lum < 160) {
-        ink++;
-        if (x < minX) minX = x;
-        if (x > maxX) maxX = x;
-        if (y < minY) minY = y;
-        if (y > maxY) maxY = y;
-      }
-    }
-  }
-
-  if (ink < 6 || maxX <= minX || maxY <= minY) return null;
-
-  const gw = maxX - minX + 1;
-  const gh = maxY - minY + 1;
-  const aspect = gw / gh;
-
-  // Check center 34% x 34% cavity brightness
-  const cx0 = Math.floor(minX + gw * 0.33);
-  const cx1 = Math.ceil(minX + gw * 0.67);
-  const cy0 = Math.floor(minY + gh * 0.33);
-  const cy1 = Math.ceil(minY + gh * 0.67);
-
-  let centerWhite = 0;
-  let centerTotal = 0;
-  for (let y = cy0; y <= Math.min(maxY, cy1); y++) {
-    for (let x = cx0; x <= Math.min(maxX, cx1); x++) {
-      const lum = d[(y * w + x) * 4];
-      if (lum > 180) centerWhite++;
-      centerTotal++;
-    }
-  }
-  const whiteRatio = centerTotal > 0 ? centerWhite / centerTotal : 0;
-
-  // Narrow/medium solid vertical stroke without hollow interior -> 1
-  if (aspect <= 0.58 && whiteRatio < 0.28) {
-    return 1;
-  }
-
-  // Wider oval with clear hollow center -> 0
-  if (aspect >= 0.48 && whiteRatio >= 0.36) {
-    return 0;
-  }
-
-  return null;
-}
-
-/**
- * Renders a single cell patch onto a padded white canvas for isolated recognition (e.g. Grand Total).
- */
 function cellPatchToDataUrl(cleanPatch: ImageData): string {
   const tmp = document.createElement('canvas');
   tmp.width = cleanPatch.width;
@@ -404,10 +288,6 @@ function cellPatchToDataUrl(cleanPatch: ImageData): string {
   return out.toDataURL('image/png');
 }
 
-/**
- * Stitches a row's product cells side-by-side onto a clean, border-free white horizontal strip
- * so Tesseract LSTM keeps full horizontal baseline & font-size context across all 5 digits.
- */
 function buildRowStripForOcr(
   rawCanvas: HTMLCanvasElement,
   productCols: Array<[ProductCol, [number, number]]>,
@@ -477,7 +357,7 @@ async function extractWithTesseractOcr(
   imageDataUrl: string,
   onProgress?: ProgressCallback
 ): Promise<ExtractionResult> {
-  onProgress?.('Preparing high-resolution grid image...', 15);
+  onProgress?.('Deskewing & preparing high-resolution grid...', 15);
   const { rawCanvas, prepDataUrl, width } = await prepareCanvases(imageDataUrl);
 
   onProgress?.('Loading offline OCR engine...', 28);
@@ -521,7 +401,7 @@ async function extractWithTesseractOcr(
       }
     }
 
-    onProgress?.('Reading each product count cell precisely...', 65);
+    onProgress?.('Reading product cells & verifying row sums...', 65);
     const spatialRecords =
       words.length > 0
         ? await parseSalesforceSpatialAndCellOcr(
@@ -539,7 +419,7 @@ async function extractWithTesseractOcr(
         ? spatialRecords
         : parseSalesforceOcrLines(rawText, avgConfidence);
 
-    const verifiedRows = records.filter((r) => !r.needsReview).length;
+    const flaggedCount = records.filter((r) => r.needsReview).length;
 
     return {
       records,
@@ -547,25 +427,12 @@ async function extractWithTesseractOcr(
       rawText,
       notes:
         records.length > 0
-          ? `Extracted ${records.length} rows via 2-pass cell OCR (${verifiedRows}/${records.length} verified against row totals).`
-          : 'Could not detect structured Salesforce rows automatically. You can paste/edit rows directly in Verify & Edit Data.',
+          ? `Extracted ${records.length} rows via OCR (${flaggedCount} row(s) flagged for visual review).`
+          : 'Could not detect structured Salesforce rows automatically. Use Paste Table or Edit.',
     };
   } finally {
     await worker.terminate();
   }
-}
-
-function cleanDigitToken(token: string): number | null {
-  const normalized = token
-    .replace(/[OoQD]/g, '0')
-    .replace(/[lI|!]/g, '1')
-    .replace(/[Zz]/g, '2')
-    .replace(/[Ss$]/g, '5')
-    .replace(/[B]/g, '8')
-    .replace(/[^0-9]/g, '');
-  if (normalized === '') return null;
-  const val = parseInt(normalized, 10);
-  return Number.isFinite(val) && val >= 0 && val <= 999 ? val : null;
 }
 
 function isSummaryRowText(text: string): boolean {
@@ -594,11 +461,6 @@ function isRecordCountArtifact(word: string): boolean {
   return /^rec[oa]?[rd]{0,2}c[oa]?[uvn]*t?$/.test(norm);
 }
 
-/**
- * Pass 1 finds visual rows, owner names, dealer codes, and header column X-coordinates.
- * Pass 2 crops every individual product cell (border-free + auto-inverted dark cells)
- * and runs digit-whitelisted SINGLE_WORD OCR so isolated 0/1/2/3 digits read accurately.
- */
 async function parseSalesforceSpatialAndCellOcr(
   words: OcrWord[],
   imageWidth: number,
@@ -672,8 +534,6 @@ async function parseSalesforceSpatialAndCellOcr(
     }
   }
 
-  // If "Grand Total" column sits at the far right edge and wasn't in OCR header words,
-  // place it in the right dark strip if the right edge is dark!
   if (headerRowIdx !== -1 && colPositions.total === undefined && colPositions.ifc !== undefined) {
     const guessTotalX = Math.min(
       imageWidth * 0.94,
@@ -689,7 +549,6 @@ async function parseSalesforceSpatialAndCellOcr(
     return [];
   }
 
-  // Detect the "Record Count" column X-position across all rows so owner names stop cleanly before it
   const recordCountXs: number[] = [];
   for (let r = headerRowIdx + 1; r < rows.length; r++) {
     for (const w of rows[r]) {
@@ -707,7 +566,6 @@ async function parseSalesforceSpatialAndCellOcr(
   const ownerXEnd = Math.min(firstProductX, recordCountXLimit);
   if (ownerXStart === 0) ownerXStart = dealerXEnd;
 
-  // Estimate typical row height & product column cell widths for clean cell cropping
   const dataRowYs: number[] = [];
   for (let r = headerRowIdx + 1; r < rows.length; r++) {
     const yMean = rows[r].reduce((s, w) => s + w.yCenter, 0) / rows[r].length;
@@ -723,7 +581,6 @@ async function parseSalesforceSpatialAndCellOcr(
       ? yGaps.sort((a, b) => a - b)[Math.floor(yGaps.length / 2)]
       : medianH * 1.9;
 
-  // Estimate column cell widths from spacing between product column centers
   const sortedProductCols = detectedCols
     .filter(([c]) => c !== 'total')
     .map(([, x]) => x)
@@ -742,23 +599,23 @@ async function parseSalesforceSpatialAndCellOcr(
       ? Math.max(prodCellW * 1.3, (imageWidth - colPositions.total) * 1.6)
       : prodCellW;
 
-  // First collect clean owner rows (skipping Subtotal and dark Grand Total footer)
   interface CandidateRow {
     yCenter: number;
     dealerCode: string;
+    dealerConf: number;
     ownerName: string;
     sourceWords: OcrWord[];
   }
 
   const candidates: CandidateRow[] = [];
   let activeDealer = '';
+  let activeDealerConf = 100;
 
   for (let r = headerRowIdx + 1; r < rows.length; r++) {
     const row = rows[r];
     const fullRowText = row.map((w) => w.text).join(' ');
     const yMean = row.reduce((s, w) => s + w.yCenter, 0) / row.length;
 
-    // Stop or skip dark Grand Total footer bar and Subtotal rows (including fuzzy OCR variants)
     if (isSummaryRowText(fullRowText)) {
       continue;
     }
@@ -767,14 +624,16 @@ async function parseSalesforceSpatialAndCellOcr(
       continue;
     }
 
+    // Preserve dealer codes / IDs strictly as strings (no silent O->0 or I->1 substitution)
     const dealerWord = row.find(
       (w) =>
         w.xCenter <= Math.max(dealerXEnd, ownerXStart) &&
-        /^\d{4,8}$/.test(w.text.replace(/[^0-9]/g, ''))
+        /^[A-Za-z0-9-]{4,14}$/.test(w.text) &&
+        /\d/.test(w.text)
     );
     if (dealerWord) {
-      const code = dealerWord.text.replace(/[^0-9]/g, '');
-      if (code.length >= 4) activeDealer = code;
+      activeDealer = dealerWord.text.trim();
+      activeDealerConf = Math.round(dealerWord.confidence || 0);
     }
 
     const ownerWords = row.filter((w) => {
@@ -788,7 +647,7 @@ async function parseSalesforceSpatialAndCellOcr(
     const ownerName = ownerWords
       .map((w) => w.text)
       .join(' ')
-      .replace(/[^a-zA-Z.\s'-]/g, ' ')
+      .replace(/[^a-zA-Z0-9.\s'-]/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
 
@@ -797,6 +656,7 @@ async function parseSalesforceSpatialAndCellOcr(
     candidates.push({
       yCenter: yMean,
       dealerCode: activeDealer || 'UNASSIGNED',
+      dealerConf: activeDealerConf,
       ownerName,
       sourceWords: row,
     });
@@ -804,17 +664,24 @@ async function parseSalesforceSpatialAndCellOcr(
 
   if (candidates.length === 0) return [];
 
-  // Detect true vertical column borders around each product column header
   const tableTopY = Math.max(0, candidates[0].yCenter - rowStepH * 0.5);
   const tableBotY = Math.min(rawCanvas.height, candidates[candidates.length - 1].yCenter + rowStepH * 0.5);
-  const gridLines = detectVerticalGridLines(
-    rawCanvas,
+  const rawLum = rgbaToLuminance(
+    rawCanvas.getContext('2d')!.getImageData(0, 0, rawCanvas.width, rawCanvas.height).data,
+    rawCanvas.width,
+    rawCanvas.height
+  );
+  const gridLines = detectVertGridLum(
+    rawLum,
+    rawCanvas.width,
+    rawCanvas.height,
     tableTopY,
     tableBotY,
-    Math.max(0, firstProductX - prodCellW)
+    Math.max(0, firstProductX - prodCellW),
+    rawCanvas.width - 4,
+    0.32
   );
 
-  // Build exact [xLeft, xRight] bounds per product column using detected gridlines
   const colBounds = new Map<ProductCol, [number, number]>();
   for (const [colName, colX] of detectedCols) {
     const halfW = (colName === 'total' ? totalCellW : prodCellW) / 2;
@@ -827,7 +694,10 @@ async function parseSalesforceSpatialAndCellOcr(
       if (leftLines.length > 0 && colX - leftLines[leftLines.length - 1] < prodCellW * 1.4) {
         leftEdge = leftLines[leftLines.length - 1];
       }
-      if (rightLines.length > 0 && rightLines[0] - colX < (colName === 'total' ? totalCellW * 1.5 : prodCellW * 1.4)) {
+      if (
+        rightLines.length > 0 &&
+        rightLines[0] - colX < (colName === 'total' ? totalCellW * 1.5 : prodCellW * 1.4)
+      ) {
         rightEdge = rightLines[0];
       }
     }
@@ -843,8 +713,6 @@ async function parseSalesforceSpatialAndCellOcr(
     colBounds.set(colName, [leftEdge, rightEdge]);
   }
 
-  // Pass 2: Read dark Grand Total cells cleanly, keep Pass 1 digits when already verified,
-  // and recover any mismatched/missing row via a clean border-free 5-cell horizontal row strip!
   await worker.setParameters({
     tessedit_pageseg_mode: PSM.SINGLE_LINE,
     tessedit_char_whitelist: '0123456789',
@@ -873,29 +741,33 @@ async function parseSalesforceSpatialAndCellOcr(
       total: undefined,
     };
     let minCellConf = 100;
+    let ambiguousObserved = false;
 
-    // 1. Pull Pass 1 spatial digits inside each product column interval
     for (const [colName] of detectedCols) {
       const [xLeft, xRight] = colBounds.get(colName)!;
       const pass1Word = row.sourceWords.find(
         (w) => w.xCenter >= xLeft - 4 && w.xCenter <= xRight + 4
       );
-      const pass1Digit = pass1Word ? cleanDigitToken(pass1Word.text) : null;
-      if (pass1Digit !== null) {
-        counts[colName] = pass1Digit;
-        minCellConf = Math.min(minCellConf, Math.round(pass1Word?.confidence || 80));
+      if (pass1Word) {
+        const parsed = parseStrictDigitToken(pass1Word.text);
+        if (parsed.value !== null) {
+          counts[colName] = parsed.value;
+          minCellConf = Math.min(minCellConf, Math.round(pass1Word.confidence || 80));
+        } else if (parsed.ambiguous) {
+          ambiguousObserved = true;
+          minCellConf = Math.min(minCellConf, 55);
+        }
       }
     }
 
-    // 2. Always read Grand Total cell cleanly (with dark-background auto-inversion)
     if (colBounds.has('total')) {
       const [txL, txR] = colBounds.get('total')!;
       const totalPatch = extractCleanCellPatch(rawCanvas, txL, txR, row.yCenter, rowStepH);
       if (totalPatch) {
         const totalRes = await worker.recognize(cellPatchToDataUrl(totalPatch));
-        const parsedTotal = cleanDigitToken((totalRes.data.text || '').trim());
-        if (parsedTotal !== null) {
-          counts.total = parsedTotal;
+        const parsedTotal = parseStrictDigitToken((totalRes.data.text || '').trim());
+        if (parsedTotal.value !== null) {
+          counts.total = parsedTotal.value;
         }
       }
     }
@@ -907,11 +779,7 @@ async function parseSalesforceSpatialAndCellOcr(
       (counts.vsd ?? 0) +
       (counts.ifc ?? 0);
 
-    // 3. Run border-free row-strip OCR whenever Pass 1 didn't verify OR had low confidence (<88%)
-    const needsRowStrip =
-      counts.total === undefined || pass1Sum !== counts.total || minCellConf < 88;
-
-    if (needsRowStrip && productColsSorted.length > 0) {
+    if (counts.total === undefined || pass1Sum !== counts.total || minCellConf < 85) {
       const { dataUrl, slotCenters } = buildRowStripForOcr(
         rawCanvas,
         productColsSorted,
@@ -944,8 +812,8 @@ async function parseSalesforceSpatialAndCellOcr(
         let stripConf = 100;
 
         for (const sw of stripWords) {
-          const val = cleanDigitToken(sw.text);
-          if (val === null) continue;
+          const parsed = parseStrictDigitToken(sw.text);
+          if (parsed.value === null) continue;
           let bestCol: ProductCol | null = null;
           let bestDist = Infinity;
           for (const slot of slotCenters) {
@@ -956,7 +824,7 @@ async function parseSalesforceSpatialAndCellOcr(
             }
           }
           if (bestCol) {
-            stripCounts[bestCol] = val;
+            stripCounts[bestCol] = parsed.value;
             stripConf = Math.min(stripConf, Math.round(sw.confidence));
           }
         }
@@ -976,40 +844,8 @@ async function parseSalesforceSpatialAndCellOcr(
             counts[col] = stripCounts[col] ?? 0;
           }
           minCellConf = stripConf;
+          ambiguousObserved = false;
         }
-      }
-    }
-
-    // 4. Topological 0/1 verification fallback when row sum still fails OR confidence < 60%
-    const curSum =
-      (counts.cd ?? 0) +
-      (counts.cdd ?? 0) +
-      (counts.vs ?? 0) +
-      (counts.vsd ?? 0) +
-      (counts.ifc ?? 0);
-
-    if (
-      (counts.total !== undefined && curSum !== counts.total) ||
-      minCellConf < 60
-    ) {
-      const topoCounts: Partial<Record<ProductCol, number>> = {};
-      for (const [col, [xLeft, xRight]] of productColsSorted) {
-        const patch = extractCleanCellPatch(rawCanvas, xLeft, xRight, row.yCenter, rowStepH);
-        const topo = patch ? classifyZeroVsOneFromPatch(patch) : null;
-        topoCounts[col] = topo !== null ? topo : (counts[col] ?? 0);
-      }
-      const topoSum =
-        (topoCounts.cd ?? 0) +
-        (topoCounts.cdd ?? 0) +
-        (topoCounts.vs ?? 0) +
-        (topoCounts.vsd ?? 0) +
-        (topoCounts.ifc ?? 0);
-
-      if (counts.total !== undefined && topoSum === counts.total) {
-        for (const [col] of productColsSorted) {
-          counts[col] = topoCounts[col] ?? 0;
-        }
-        minCellConf = Math.max(minCellConf, 88);
       }
     }
 
@@ -1023,8 +859,8 @@ async function parseSalesforceSpatialAndCellOcr(
     const rowSum = cd + cdd + vs + vsd + ifc;
     const totalMatched = sourceRowTotal !== undefined && rowSum === sourceRowTotal;
     const mismatch = sourceRowTotal !== undefined && rowSum !== sourceRowTotal;
-    const rowConf = totalMatched ? 100 : Math.min(defaultConfidence, minCellConf);
-    const lowConf = !totalMatched && rowConf < 75;
+    const rowConf = Math.min(row.dealerConf, Math.min(defaultConfidence, minCellConf));
+    const lowConf = !totalMatched && rowConf < 78;
 
     records.push({
       id: `ocr-${i}-${Date.now()}`,
@@ -1036,22 +872,21 @@ async function parseSalesforceSpatialAndCellOcr(
       vsd,
       ifc,
       sourceRowTotal,
-      confidence: rowConf,
-      needsReview: mismatch || lowConf,
+      confidence: totalMatched ? Math.min(98, rowConf) : rowConf,
+      needsReview: mismatch || lowConf || ambiguousObserved || row.dealerConf < 80,
       reviewReason: mismatch
         ? `Product sum (${rowSum}) != row total (${sourceRowTotal})`
-        : lowConf
-          ? `OCR confidence ${rowConf}% — double-check values`
-          : undefined,
+        : ambiguousObserved
+          ? 'Ambiguous OCR characters observed — verify against original image'
+          : lowConf || row.dealerConf < 80
+            ? `Low OCR confidence (${rowConf}%) — verify values`
+            : undefined,
     });
   }
 
   return records;
 }
 
-/**
- * Fallback plain-text line parser when spatial header X-coordinates aren't detected.
- */
 export function parseSalesforceOcrLines(rawText: string, defaultConfidence = 80): OwnerRecord[] {
   const lines = rawText
     .split(/\r?\n/)
@@ -1068,8 +903,8 @@ export function parseSalesforceOcrLines(rawText: string, defaultConfidence = 80)
     }
 
     let working = line;
-    const dealerMatch = working.match(/^(?:\S{1,2}\s+)?(\d{4,8})\s+(.+)$/);
-    if (dealerMatch) {
+    const dealerMatch = working.match(/^(?:\S{1,2}\s+)?([A-Za-z0-9-]{4,14})\s+(.+)$/);
+    if (dealerMatch && /\d/.test(dealerMatch[1])) {
       activeDealer = dealerMatch[1];
       working = dealerMatch[2].trim();
     }
@@ -1079,9 +914,9 @@ export function parseSalesforceOcrLines(rawText: string, defaultConfidence = 80)
     let splitIdx = tokens.length;
 
     for (let t = tokens.length - 1; t >= 0 && trailingNums.length < 6; t--) {
-      const n = cleanDigitToken(tokens[t]);
-      if (n !== null && tokens[t].length <= 4) {
-        trailingNums.unshift(n);
+      const parsed = parseStrictDigitToken(tokens[t]);
+      if (parsed.value !== null && tokens[t].length <= 4) {
+        trailingNums.unshift(parsed.value);
         splitIdx = t;
       } else {
         break;
@@ -1097,7 +932,7 @@ export function parseSalesforceOcrLines(rawText: string, defaultConfidence = 80)
       .filter((t) => !isRecordCountArtifact(t))
       .join(' ')
       .replace(/record\s*count/gi, '')
-      .replace(/[^a-zA-Z.\s'-]/g, ' ')
+      .replace(/[^a-zA-Z0-9.\s'-]/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
 

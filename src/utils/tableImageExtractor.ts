@@ -1,9 +1,40 @@
 import { createWorker, PSM } from 'tesseract.js';
 import { loadImageElement } from './ocrExtractor';
+import {
+  checkTableSumDiscrepancies,
+  cleanCellPatchAndCheckEmpty,
+  deMoireDirectional,
+  detectBorderedTableGrid,
+  detectVerticalGridLines,
+  estimateSkewAngleDeg,
+  evaluateCellConfidenceAndFlags,
+  isIdentifierHeader,
+  isStrictNumericHeader,
+  looksLikeStringIdValue,
+  normalizeForGridDetection,
+  normalizeIlluminationAndGlare,
+  rgbaToLuminance,
+  rotateRgbaBilinear,
+  sauvolaAdaptiveThreshold,
+  warpRgbaPerspective,
+  type CornerPoints,
+  type ExtractedCell,
+} from './tableVisionCore';
+
+export type { CornerPoints, ExtractedCell };
 
 export interface ExtractedTableResult {
   matrix: string[][];
-  confidence: number;
+  cells: ExtractedCell[][];
+  headers: string[];
+  averageConfidence: number;
+  uncertainCount: number;
+  rowIntegrityWarnings: string[];
+  originalImageUrl: string;
+  dewarpedImageUrl: string;
+  dewarpedDimensions: { width: number; height: number };
+  skewAngleDeg: number;
+  canReconstructReliably: boolean;
   notes: string;
 }
 
@@ -21,192 +52,111 @@ interface OcrWord {
 export type TableProgressCallback = (status: string, pct: number) => void;
 
 /**
- * Prepares a clean, de-moiréd, shadow-normalized grayscale canvas specifically tuned for
- * camera photos of laptop/monitor screens and printed tables (dissolves LCD stripes without
- * sharpening noise).
- */
-function buildDeMoireOcrCanvas(srcCanvas: HTMLCanvasElement): HTMLCanvasElement {
-  const w = srcCanvas.width;
-  const h = srcCanvas.height;
-  const srcData = srcCanvas.getContext('2d')!.getImageData(0, 0, w, h).data;
-  const n = w * h;
-
-  // 1. Convert to luminance
-  const lum = new Float32Array(n);
-  for (let i = 0, p = 0; i < n; i++, p += 4) {
-    lum[i] = 0.299 * srcData[p] + 0.587 * srcData[p + 1] + 0.114 * srcData[p + 2];
-  }
-
-  // 2. Mild 3x3 weighted Gaussian smooth to dissolve vertical LCD subpixel moiré stripes
-  const smooth = new Float32Array(n);
-  for (let y = 0; y < h; y++) {
-    const y0 = Math.max(0, y - 1);
-    const y1 = Math.min(h - 1, y + 1);
-    for (let x = 0; x < w; x++) {
-      const x0 = Math.max(0, x - 1);
-      const x1 = Math.min(w - 1, x + 1);
-      smooth[y * w + x] =
-        (lum[y0 * w + x0] +
-          2 * lum[y0 * w + x] +
-          lum[y0 * w + x1] +
-          2 * lum[y * w + x0] +
-          4 * lum[y * w + x] +
-          2 * lum[y * w + x1] +
-          lum[y1 * w + x0] +
-          2 * lum[y1 * w + x] +
-          lum[y1 * w + x1]) /
-        16;
-    }
-  }
-
-  // 3. Fast local white-point estimation (separable dilation + blur) to remove glare/shadows
-  const rad = Math.max(12, Math.min(34, Math.round(Math.min(w, h) * 0.025)));
-  const bg = estimateLocalMaxBlur(smooth, w, h, rad);
-
-  // 4. Normalize background to clean white & darken ink smoothly around pivot 200
-  const out = new Uint8ClampedArray(n * 4);
-  for (let i = 0, p = 0; i < n; i++, p += 4) {
-    const norm = Math.min(255, (smooth[i] / Math.max(45, bg[i])) * 255);
-    let val = (norm - 200) * 1.65 + 204;
-    if (val > 238) val = 255;
-    val = Math.max(0, Math.min(255, val));
-    out[p] = val;
-    out[p + 1] = val;
-    out[p + 2] = val;
-    out[p + 3] = 255;
-  }
-
-  const outCanvas = document.createElement('canvas');
-  outCanvas.width = w;
-  outCanvas.height = h;
-  outCanvas.getContext('2d')!.putImageData(new ImageData(out, w, h), 0, 0);
-  return outCanvas;
-}
-
-function estimateLocalMaxBlur(
-  channel: Float32Array,
-  width: number,
-  height: number,
-  radius: number
-): Float32Array {
-  const temp = new Float32Array(width * height);
-  const out = new Float32Array(width * height);
-  const deque = new Int32Array(width);
-
-  for (let y = 0; y < height; y++) {
-    const rowOff = y * width;
-    let head = 0;
-    let tail = 0;
-    for (let x = 0; x < width + radius; x++) {
-      if (x < width) {
-        const val = channel[rowOff + x];
-        while (tail > head && channel[rowOff + deque[tail - 1]] <= val) tail--;
-        deque[tail++] = x;
-      }
-      const center = x - radius;
-      if (center >= 0) {
-        while (head < tail && deque[head] < center - radius) head++;
-        temp[rowOff + center] = channel[rowOff + deque[head]];
-      }
-    }
-  }
-
-  const vDeque = new Int32Array(height);
-  for (let x = 0; x < width; x++) {
-    let head = 0;
-    let tail = 0;
-    for (let y = 0; y < height + radius; y++) {
-      if (y < height) {
-        const val = temp[y * width + x];
-        while (tail > head && temp[vDeque[tail - 1] * width + x] <= val) tail--;
-        vDeque[tail++] = y;
-      }
-      const center = y - radius;
-      if (center >= 0) {
-        while (head < tail && vDeque[head] < center - radius) head++;
-        out[center * width + x] = temp[vDeque[head] * width + x];
-      }
-    }
-  }
-
-  // Quick horizontal+vertical box blur
-  const blurR = Math.max(4, Math.round(radius * 0.4));
-  const win = blurR * 2 + 1;
-  const bTmp = new Float32Array(width * height);
-  const bDst = new Float32Array(width * height);
-
-  for (let y = 0; y < height; y++) {
-    const row = y * width;
-    let sum = 0;
-    for (let k = -blurR; k <= blurR; k++) sum += out[row + Math.min(width - 1, Math.max(0, k))];
-    for (let x = 0; x < width; x++) {
-      bTmp[row + x] = sum / win;
-      sum += out[row + Math.min(width - 1, x + blurR + 1)] - out[row + Math.max(0, x - blurR)];
-    }
-  }
-
-  for (let x = 0; x < width; x++) {
-    let sum = 0;
-    for (let k = -blurR; k <= blurR; k++) sum += bTmp[Math.min(height - 1, Math.max(0, k)) * width + x];
-    for (let y = 0; y < height; y++) {
-      bDst[y * width + x] = sum / win;
-      sum += bTmp[Math.min(height - 1, y + blurR + 1) * width + x] - bTmp[Math.max(0, y - blurR) * width + x];
-    }
-  }
-  return bDst;
-}
-
-/**
- * Extracts a structured text/table matrix (`string[][]`) from any camera photo
- * or screenshot of a report/Excel sheet and returns clean cells for digital rendering.
+ * Extracts a structured text/table matrix + per-cell confidence & source-photo crops
+ * from a camera photo or screenshot without silently altering IDs or inventing missing data.
  */
 export async function extractTableMatrixFromImage(
   imageDataUrl: string,
-  onProgress?: TableProgressCallback
+  onProgress?: TableProgressCallback,
+  options: { customCorners?: CornerPoints } = {}
 ): Promise<ExtractedTableResult> {
-  onProgress?.('De-moiré & lighting cleanup...', 12);
+  onProgress?.('Preparing perspective dewarp & de-moiré...', 10);
   const img = await loadImageElement(imageDataUrl);
 
-  const targetMax = Math.max(img.naturalWidth, img.naturalHeight) < 1200 ? 1800 : 1900;
+  // Build normalized working RGBA buffer (upscale small screenshots, cap large photos at 2000px)
+  const targetMax = Math.max(img.naturalWidth, img.naturalHeight) < 1200 ? 1900 : 2000;
   const scale = Math.min(2.6, targetMax / Math.max(img.naturalWidth, img.naturalHeight));
-  const w = Math.max(1, Math.round(img.naturalWidth * scale));
-  const h = Math.max(1, Math.round(img.naturalHeight * scale));
+  let w = Math.max(1, Math.round(img.naturalWidth * scale));
+  let h = Math.max(1, Math.round(img.naturalHeight * scale));
 
-  const srcCanvas = document.createElement('canvas');
-  srcCanvas.width = w;
-  srcCanvas.height = h;
-  const sCtx = srcCanvas.getContext('2d')!;
-  sCtx.imageSmoothingEnabled = true;
-  sCtx.imageSmoothingQuality = 'high';
-  sCtx.drawImage(img, 0, 0, w, h);
+  const workCanvas = document.createElement('canvas');
+  workCanvas.width = w;
+  workCanvas.height = h;
+  const wCtx = workCanvas.getContext('2d')!;
+  wCtx.imageSmoothingEnabled = true;
+  wCtx.imageSmoothingQuality = 'high';
+  wCtx.drawImage(img, 0, 0, w, h);
 
-  // Detect dark bottom taskbar on raw image before normalization
-  const rawD = sCtx.getImageData(0, 0, w, h).data;
+  let rgba = wCtx.getImageData(0, 0, w, h).data;
+  let skewAngleDeg = 0;
+
+  // Step 1: Perspective correction (manual 4-corner quad if provided) + automatic deskew
+  if (options.customCorners) {
+    const c = options.customCorners;
+    const dist = (a: { x: number; y: number }, b: { x: number; y: number }) =>
+      Math.hypot((a.x - b.x) * w, (a.y - b.y) * h);
+    const dstW = Math.max(240, Math.min(2200, Math.round((dist(c.tl, c.tr) + dist(c.bl, c.br)) / 2)));
+    const dstH = Math.max(200, Math.min(2200, Math.round((dist(c.tl, c.bl) + dist(c.tr, c.br)) / 2)));
+    rgba = warpRgbaPerspective(rgba, w, h, c, dstW, dstH);
+    w = dstW;
+    h = dstH;
+  } else {
+    const rawLum = rgbaToLuminance(rgba, w, h);
+    skewAngleDeg = estimateSkewAngleDeg(rawLum, w, h);
+    if (Math.abs(skewAngleDeg) >= 0.35) {
+      rgba = rotateRgbaBilinear(rgba, w, h, skewAngleDeg);
+    }
+  }
+
+  // Keep a clean RGB canvas of the dewarped original image as visual source-of-truth for cell crops
+  const dewarpedOrigCanvas = document.createElement('canvas');
+  dewarpedOrigCanvas.width = w;
+  dewarpedOrigCanvas.height = h;
+  dewarpedOrigCanvas.getContext('2d')!.putImageData(new ImageData(new Uint8ClampedArray(rgba), w, h), 0, 0);
+  const dewarpedImageUrl = dewarpedOrigCanvas.toDataURL('image/jpeg', 0.92);
+
+  // Detect dark monitor bezel/taskbar at bottom (must be a contiguous >=18px dark band, never a 1-3px gridline!)
   let cutBottomY = h;
+  let darkRun = 0;
   for (let y = Math.floor(h * 0.72); y < h; y++) {
     let rowSum = 0;
     for (let x = 0; x < w; x += 4) {
       const i = (y * w + x) * 4;
-      rowSum += 0.299 * rawD[i] + 0.587 * rawD[i + 1] + 0.114 * rawD[i + 2];
+      rowSum += 0.299 * rgba[i] + 0.587 * rgba[i + 1] + 0.114 * rgba[i + 2];
     }
     if (rowSum / (w / 4) < 115) {
-      cutBottomY = Math.max(0, y - 8);
-      break;
+      darkRun++;
+      if (darkRun >= 18) {
+        cutBottomY = Math.max(0, y - darkRun - 4);
+        break;
+      }
+    } else {
+      darkRun = 0;
     }
   }
 
-  const cleanCanvas = buildDeMoireOcrCanvas(srcCanvas);
-  const oCtx = cleanCanvas.getContext('2d')!;
-  if (cutBottomY < h) {
-    oCtx.fillStyle = '#FFFFFF';
-    oCtx.fillRect(0, cutBottomY, w, h - cutBottomY);
+  // Step 2: Directional de-moiré + grid-preserving normalization + OCR illumination normalization
+  const lum0 = rgbaToLuminance(rgba, w, h);
+  const deMoired = deMoireDirectional(lum0, w, h);
+  const gridLum = normalizeForGridDetection(deMoired, w, h);
+  const cleanLum = normalizeIlluminationAndGlare(deMoired, w, h);
+
+  // Mask bottom dark taskbar region on cleanLum
+  for (let y = cutBottomY; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      cleanLum[y * w + x] = 255;
+    }
   }
 
-  onProgress?.('Detecting table layout & text...', 30);
+  // Build normalized grayscale canvas for Pass 1 layout OCR
+  const cleanCanvas = document.createElement('canvas');
+  cleanCanvas.width = w;
+  cleanCanvas.height = h;
+  const cleanRgba = new Uint8ClampedArray(w * h * 4);
+  for (let i = 0, p = 0; i < cleanLum.length; i++, p += 4) {
+    const v = cleanLum[i];
+    cleanRgba[p] = v;
+    cleanRgba[p + 1] = v;
+    cleanRgba[p + 2] = v;
+    cleanRgba[p + 3] = 255;
+  }
+  cleanCanvas.getContext('2d')!.putImageData(new ImageData(cleanRgba, w, h), 0, 0);
+
+  onProgress?.('Detecting table structure & text...', 30);
   const worker = await createWorker('eng', 1, {
     logger: (m) => {
       if (m.status === 'recognizing text' && typeof m.progress === 'number') {
-        onProgress?.('Reading table structure...', 32 + Math.round(m.progress * 28));
+        onProgress?.('Reading table layout...', 32 + Math.round(m.progress * 26));
       }
     },
   });
@@ -244,131 +194,86 @@ export async function extractTableMatrixFromImage(
       }
     }
 
-    onProgress?.('Re-reading cells for maximum accuracy...', 65);
-    const matrix = await buildAndRefineTable(
+    onProgress?.('Segmenting cells & checking confidence...', 62);
+    const extracted = await buildStructuredCells(
       words,
-      cleanCanvas,
+      gridLum,
+      cleanLum,
+      dewarpedOrigCanvas,
       w,
+      h,
       cutBottomY,
       worker,
       onProgress
     );
 
+    const matrix = extracted.cells.map((row) => row.map((cell) => cell.value));
+    const headers = extracted.headerRowIdx >= 0 && matrix[extracted.headerRowIdx]
+      ? matrix[extracted.headerRowIdx]
+      : matrix[0] || [];
+
+    const allFlat = extracted.cells.flat();
+    const nonEmptyCells = allFlat.filter((c) => c.value !== '' || c.uncertain);
+    const avgConf =
+      nonEmptyCells.length > 0
+        ? Math.round(nonEmptyCells.reduce((s, c) => s + c.confidence, 0) / nonEmptyCells.length)
+        : Math.round(res.data.confidence || 0);
+    const uncertainCount = allFlat.filter((c) => c.uncertain).length;
+    const canReconstructReliably =
+      matrix.length >= 2 && (matrix[0]?.length ?? 0) >= 2 && avgConf >= 45;
+
     return {
       matrix,
-      confidence: Math.round(res.data.confidence || 0),
-      notes:
-        matrix.length > 0
-          ? `Converted image into ${matrix.length} rows × ${matrix[0].length} columns.`
-          : 'No table detected in image.',
+      cells: extracted.cells,
+      headers,
+      averageConfidence: avgConf,
+      uncertainCount,
+      rowIntegrityWarnings: extracted.rowIntegrityWarnings,
+      originalImageUrl: imageDataUrl,
+      dewarpedImageUrl,
+      dewarpedDimensions: { width: w, height: h },
+      skewAngleDeg,
+      canReconstructReliably,
+      notes: canReconstructReliably
+        ? `Extracted ${matrix.length} rows × ${matrix[0].length} columns (avg confidence ${avgConf}%, ${uncertainCount} flagged for review).`
+        : 'Table structure could not be reliably reconstructed. Use 4-corner crop or manual editing.',
     };
   } finally {
     await worker.terminate();
   }
 }
 
-/**
- * Finds vertical cell borders across a single horizontal row band (works even when the
- * entire camera photo has a slight tilt because a single row is only ~35px tall!).
- */
-function detectRowVerticalBorders(
-  canvas: HTMLCanvasElement,
-  y0: number,
-  y1: number,
-  xMin: number,
-  xMax: number
-): number[] {
-  const w = canvas.width;
-  const h = canvas.height;
-  const top = Math.max(0, Math.round(y0));
-  const bot = Math.min(h - 1, Math.round(y1));
-  const left = Math.max(3, Math.round(xMin));
-  const right = Math.min(w - 4, Math.round(xMax));
-  const rowH = bot - top;
-  if (rowH < 8 || right <= left + 20) return [];
-
-  const data = canvas.getContext('2d')!.getImageData(0, top, w, rowH).data;
-  const score = new Float32Array(w);
-
-  for (let x = left; x < right; x++) {
-    let darkHits = 0;
-    for (let y = 0; y < rowH; y++) {
-      const lum = data[(y * w + x) * 4];
-      const lumL = data[(y * w + (x - 3)) * 4];
-      const lumR = data[(y * w + (x + 3)) * 4];
-      if (lum < 228 && lumL - lum > 7 && lumR - lum > 7) {
-        darkHits++;
-      }
-    }
-    score[x] = darkHits / rowH;
-  }
-
-  // Pick peaks where at least 60% of the row band has a vertical border
-  const peaks: number[] = [];
-  for (let x = left + 2; x < right - 2; x++) {
-    if (score[x] >= 0.6 && score[x] >= score[x - 1] && score[x] >= score[x + 1]) {
-      const prev = peaks[peaks.length - 1];
-      if (prev === undefined || x - prev > 36) {
-        peaks.push(x);
-      } else if (score[x] > score[prev]) {
-        peaks[peaks.length - 1] = x;
-      }
-    }
-  }
-  return peaks;
-}
-
-function cropCleanCellDataUrl(
-  canvas: HTMLCanvasElement,
-  xLeft: number,
-  xRight: number,
-  yTop: number,
-  yBot: number
-): string | null {
-  const insetX = Math.min(7, Math.max(3, Math.round((xRight - xLeft) * 0.03)));
-  const insetY = Math.min(6, Math.max(3, Math.round((yBot - yTop) * 0.11)));
-  const sx = Math.max(0, Math.round(xLeft + insetX));
-  const ex = Math.min(canvas.width, Math.round(xRight - insetX));
-  const sy = Math.max(0, Math.round(yTop + insetY));
-  const ey = Math.min(canvas.height, Math.round(yBot - insetY));
-  const cw = ex - sx;
-  const ch = ey - sy;
-  if (cw < 10 || ch < 10) return null;
-
-  const patch = canvas.getContext('2d')!.getImageData(sx, sy, cw, ch);
-  const d = patch.data;
-
-  // Erase any horizontal cell border lines spanning >= 70% of cell width so they aren't read as '=' or '-'
-  for (let y = 0; y < ch; y++) {
-    let rowDark = 0;
-    for (let x = 0; x < cw; x++) {
-      if (d[(y * cw + x) * 4] < 175) rowDark++;
-    }
-    if (rowDark >= cw * 0.7) {
-      for (let x = 0; x < cw; x++) {
-        const idx = (y * cw + x) * 4;
-        d[idx] = 255;
-        d[idx + 1] = 255;
-        d[idx + 2] = 255;
-      }
-    }
-  }
-
-  // Check if cell actually contains dark text ink
-  let ink = 0;
-  for (let y = 0; y < ch; y++) {
-    for (let x = 0; x < cw; x++) {
-      if (d[(y * cw + x) * 4] < 165) ink++;
-    }
-  }
-  if (ink < 10) return null;
-
+function patchLumToOcrDataUrl(
+  patchLum: Float32Array,
+  cw: number,
+  ch: number,
+  useSauvola = false
+): string {
   const tmp = document.createElement('canvas');
   tmp.width = cw;
   tmp.height = ch;
-  tmp.getContext('2d')!.putImageData(patch, 0, 0);
+  const rgba = new Uint8ClampedArray(cw * ch * 4);
 
-  const scale = ch < 40 ? 2 : 1.5;
+  if (useSauvola) {
+    const bin = sauvolaAdaptiveThreshold(patchLum, cw, ch, 10, 0.18);
+    for (let i = 0, p = 0; i < bin.length; i++, p += 4) {
+      rgba[p] = bin[i];
+      rgba[p + 1] = bin[i];
+      rgba[p + 2] = bin[i];
+      rgba[p + 3] = 255;
+    }
+  } else {
+    for (let i = 0, p = 0; i < patchLum.length; i++, p += 4) {
+      const v = Math.max(0, Math.min(255, patchLum[i]));
+      rgba[p] = v;
+      rgba[p + 1] = v;
+      rgba[p + 2] = v;
+      rgba[p + 3] = 255;
+    }
+  }
+  tmp.getContext('2d')!.putImageData(new ImageData(rgba, cw, ch), 0, 0);
+
+  const scale = ch < 40 ? 2.4 : 1.6;
   const pad = 22;
   const out = document.createElement('canvas');
   out.width = Math.round(cw * scale) + pad * 2;
@@ -382,17 +287,41 @@ function cropCleanCellDataUrl(
   return out.toDataURL('image/png');
 }
 
-async function buildAndRefineTable(
+function cropOriginalCellSnippet(
+  origCanvas: HTMLCanvasElement,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number
+): string {
+  const sx = Math.max(0, Math.round(x0));
+  const sy = Math.max(0, Math.round(y0));
+  const sw = Math.max(8, Math.min(origCanvas.width - sx, Math.round(x1 - x0)));
+  const sh = Math.max(8, Math.min(origCanvas.height - sy, Math.round(y1 - y0)));
+
+  const out = document.createElement('canvas');
+  out.width = sw;
+  out.height = sh;
+  out.getContext('2d')!.drawImage(origCanvas, sx, sy, sw, sh, 0, 0, sw, sh);
+  return out.toDataURL('image/jpeg', 0.9);
+}
+
+async function buildStructuredCells(
   allWords: OcrWord[],
-  cleanCanvas: HTMLCanvasElement,
+  gridLum: Float32Array,
+  _cleanLum: Float32Array,
+  origCanvas: HTMLCanvasElement,
   imgW: number,
+  imgH: number,
   maxY: number,
   worker: Awaited<ReturnType<typeof createWorker>>,
   onProgress?: TableProgressCallback
-): Promise<string[][]> {
-  if (allWords.length === 0) return [];
-
-  // 1. Cluster words into horizontal lines
+): Promise<{
+  cells: ExtractedCell[][];
+  headerRowIdx: number;
+  rowIntegrityWarnings: string[];
+}> {
+  // 1. Cluster Pass 1 words (when available) solely to locate candidate table hint region
   const sorted = [...allWords]
     .filter((w) => w.yCenter < maxY)
     .sort((a, b) => a.yCenter - b.yCenter || a.x0 - b.x0);
@@ -415,7 +344,7 @@ async function buildAndRefineTable(
   }
   rawRows.forEach((r) => r.sort((a, b) => a.x0 - b.x0));
 
-  // 2. Strip Excel row-number gutter on the left (sequential numbers 30, 31, 32...)
+  // Strip Excel left row-number gutter (ascending integers e.g. 30, 31, 32...)
   let gutterRightX = 0;
   const leftNums: Array<{ val: number; x1: number }> = [];
   for (const row of rawRows) {
@@ -434,8 +363,8 @@ async function buildAndRefineTable(
     }
   }
 
-  // Filter Excel UI chrome rows (A B C D E F, Sheet1/Sheet2, Workbook Statistics, stray single chars)
-  const filteredRows: Array<{ words: OcrWord[]; yCenter: number; y0: number; y1: number }> = [];
+  // Filter Excel UI chrome rows (A B C D E F, Sheet1/Sheet2, Workbook Statistics, fx bar)
+  const filteredRows: Array<{ words: OcrWord[]; yCenter: number }> = [];
   for (const row of rawRows) {
     const rowWords = row.filter((w) => w.xCenter > gutterRightX);
     if (rowWords.length === 0) continue;
@@ -448,137 +377,92 @@ async function buildAndRefineTable(
     if (rowWords.length === 1 && joined.length <= 2 && !/^\d+$/.test(joined)) continue;
 
     const yCenter = rowWords.reduce((s, w) => s + w.yCenter, 0) / rowWords.length;
-    const y0 = Math.min(...rowWords.map((w) => w.y0));
-    const y1 = Math.max(...rowWords.map((w) => w.y1));
-    filteredRows.push({ words: rowWords, yCenter, y0, y1 });
+    filteredRows.push({ words: rowWords, yCenter });
   }
 
-  if (filteredRows.length === 0) return [];
-
-  // 3. Split into vertical table blocks at blank row gaps and pick primary table
-  const ySteps: number[] = [];
-  for (let i = 1; i < filteredRows.length; i++) {
-    const step = filteredRows[i].yCenter - filteredRows[i - 1].yCenter;
-    if (step > medianH * 0.8 && step < medianH * 3.5) ySteps.push(step);
-  }
-  const typicalStep =
-    ySteps.length > 0
-      ? ySteps.sort((a, b) => a - b)[Math.floor(ySteps.length / 2)]
-      : medianH * 1.9;
-
-  const blocks: Array<typeof filteredRows> = [[filteredRows[0]]];
-  for (let i = 1; i < filteredRows.length; i++) {
-    const gap = filteredRows[i].yCenter - filteredRows[i - 1].yCenter;
-    if (gap > typicalStep * 2.0) {
-      blocks.push([filteredRows[i]]);
-    } else {
-      blocks[blocks.length - 1].push(filteredRows[i]);
+  let targetBlock: typeof filteredRows = [];
+  let typicalStep = medianH * 1.9;
+  if (filteredRows.length > 0) {
+    const ySteps: number[] = [];
+    for (let i = 1; i < filteredRows.length; i++) {
+      const step = filteredRows[i].yCenter - filteredRows[i - 1].yCenter;
+      if (step > medianH * 0.8 && step < medianH * 3.5) ySteps.push(step);
     }
-  }
+    if (ySteps.length > 0) {
+      typicalStep = ySteps.sort((a, b) => a - b)[Math.floor(ySteps.length / 2)];
+    }
 
-  let targetBlock = blocks[0];
-  if (blocks.length > 1) {
-    targetBlock = blocks.reduce((best, cur) => {
-      const score = (blk: typeof filteredRows) => {
-        const text = blk.map((r) => r.words.map((w) => w.text).join(' ')).join(' ');
-        let s = blk.length * 10;
-        if (/grand\s*total|subtotal/i.test(text)) s += 60;
-        if (/dealer|stage|deal\s*id|owner|preparation|submitted/i.test(text)) s += 30;
-        return s;
-      };
-      return score(cur) > score(best) ? cur : best;
-    }, blocks[0]);
-  }
-
-  // Stop targetBlock cleanly right after "Grand Total" row if Excel trailing rows exist below it
-  const gtRowIdx = targetBlock.findIndex((r) =>
-    /\bgrand\s*total\b/i.test(r.words.map((w) => w.text).join(' '))
-  );
-  if (gtRowIdx >= 2 && gtRowIdx < targetBlock.length - 1) {
-    targetBlock = targetBlock.slice(0, gtRowIdx + 1);
-  }
-
-  // Drop spurious leading 1-word noise row before the actual table header
-  if (
-    targetBlock.length >= 4 &&
-    targetBlock[0].words.length === 1 &&
-    targetBlock[0].words[0].text.length <= 2 &&
-    targetBlock[1].words.length >= 3
-  ) {
-    targetBlock = targetBlock.slice(1);
-  }
-
-  if (targetBlock.length === 0) return [];
-
-  // 4. Identify the main column header row (prefer row with >= 4 distinct header words / keywords)
-  let headerRowIdx = 0;
-  for (let r = 0; r < Math.min(3, targetBlock.length); r++) {
-    const txt = targetBlock[r].words.map((w) => w.text).join(' ');
-    if (/dealer|stage|preparation|post\s*do|submitted|grand\s*total|issued|opportunity/i.test(txt)) {
-      if (targetBlock[r].words.length >= targetBlock[headerRowIdx].words.length) {
-        headerRowIdx = r;
+    const blocks: Array<typeof filteredRows> = [[filteredRows[0]]];
+    for (let i = 1; i < filteredRows.length; i++) {
+      const gap = filteredRows[i].yCenter - filteredRows[i - 1].yCenter;
+      if (gap > typicalStep * 2.0) {
+        blocks.push([filteredRows[i]]);
+      } else {
+        blocks[blocks.length - 1].push(filteredRows[i]);
       }
     }
+
+    targetBlock = blocks[0];
+    if (blocks.length > 1) {
+      targetBlock = blocks.reduce((best, cur) => {
+        const score = (blk: typeof filteredRows) => {
+          const text = blk.map((r) => r.words.map((w) => w.text).join(' ')).join(' ');
+          let s = blk.length * 10;
+          if (/grand\s*total|subtotal/i.test(text)) s += 60;
+          if (/dealer|stage|deal\s*id|owner|preparation|submitted/i.test(text)) s += 30;
+          return s;
+        };
+        return score(cur) > score(best) ? cur : best;
+      }, blocks[0]);
+    }
   }
 
-  const headerRow = targetBlock[headerRowIdx];
-  const dataMinX = Math.max(
-    gutterRightX,
-    Math.min(...targetBlock.flatMap((r) => r.words.map((w) => w.x0))) - 24
-  );
-  const dataMaxX = Math.min(
-    imgW,
-    Math.max(...targetBlock.flatMap((r) => r.words.map((w) => w.x1))) + 24
-  );
+  // 2. Grid-first pixel geometry detection (does NOT drop rows/columns missed by Pass 1!)
+  const hintBox =
+    targetBlock.length > 0
+      ? {
+          hintX0: Math.max(
+            gutterRightX,
+            Math.min(...targetBlock.flatMap((r) => r.words.map((w) => w.x0))) - 18
+          ),
+          hintX1: Math.min(
+            imgW - 2,
+            Math.max(...targetBlock.flatMap((r) => r.words.map((w) => w.x1))) + 18
+          ),
+          hintY0: Math.max(2, targetBlock[0].yCenter - typicalStep * 0.6),
+          hintY1: Math.min(maxY - 2, targetBlock[targetBlock.length - 1].yCenter + typicalStep * 0.6),
+          maxY,
+        }
+      : { hintX0: gutterRightX, hintX1: imgW - 2, maxY };
 
-  // Detect vertical borders on individual thin row bands (header + first 4 data rows),
-  // then keep only consensus borders appearing across >= 2 rows within +-12px (eliminates stray digits/noise!)
-  const candidateRowsForBorders = targetBlock.slice(
-    headerRowIdx,
-    Math.min(targetBlock.length, headerRowIdx + 5)
-  );
-  const borderSets = candidateRowsForBorders.map((r) =>
-    detectRowVerticalBorders(
-      cleanCanvas,
-      r.yCenter - typicalStep * 0.44,
-      r.yCenter + typicalStep * 0.44,
-      dataMinX - 10,
-      dataMaxX + 10
-    ).filter((bx) => !headerRow.words.some((w) => bx > w.x0 + 4 && bx < w.x1 - 4))
-  );
+  const gridGeom = detectBorderedTableGrid(gridLum, imgW, imgH, hintBox);
 
-  // Cluster border X candidates across rows (tolerance +-14px for slight tilt)
-  const allBorderXs = borderSets.flat().sort((a, b) => a - b);
-  const headerBorders: number[] = [];
-  let cluster: number[] = [];
-  for (const bx of allBorderXs) {
-    if (cluster.length === 0 || bx - cluster[cluster.length - 1] <= 14) {
-      cluster.push(bx);
-    } else {
-      if (cluster.length >= 2) {
-        headerBorders.push(Math.round(cluster.reduce((s, v) => s + v, 0) / cluster.length));
+  let rowBounds: Array<[number, number]> = [];
+  let colBounds: Array<[number, number]> = [];
+
+  if (gridGeom && gridGeom.rowYs.length >= 3 && gridGeom.colXs.length >= 3) {
+    for (let r = 0; r < gridGeom.rowYs.length - 1; r++) {
+      if (gridGeom.rowYs[r + 1] - gridGeom.rowYs[r] >= 14) {
+        rowBounds.push([gridGeom.rowYs[r], gridGeom.rowYs[r + 1]]);
       }
-      cluster = [bx];
     }
-  }
-  if (cluster.length >= 2) {
-    headerBorders.push(Math.round(cluster.reduce((s, v) => s + v, 0) / cluster.length));
-  }
-
-  let baseColBounds: Array<[number, number]> = [];
-  if (headerBorders.length >= 3) {
-    const b = [...headerBorders];
-    if (b[0] - dataMinX > 36) b.unshift(dataMinX);
-    if (dataMaxX - b[b.length - 1] > 36) b.push(dataMaxX);
-    for (let i = 0; i < b.length - 1; i++) {
-      if (b[i + 1] - b[i] >= 36) baseColBounds.push([b[i], b[i + 1]]);
+    for (let c = 0; c < gridGeom.colXs.length - 1; c++) {
+      if (gridGeom.colXs[c + 1] - gridGeom.colXs[c] >= 24) {
+        colBounds.push([gridGeom.colXs[c], gridGeom.colXs[c + 1]]);
+      }
     }
-  }
-
-  // Fallback: cluster header words using generous column-gap threshold (>= 28px)
-  if (baseColBounds.length < 3) {
+  } else {
+    // Fallback for borderless tables using Pass 1 row/column word clusters
+    if (targetBlock.length === 0) {
+      return { cells: [], headerRowIdx: 0, rowIntegrityWarnings: [] };
+    }
+    rowBounds = targetBlock.map((r) => [
+      Math.max(0, r.yCenter - typicalStep * 0.48),
+      Math.min(maxY, r.yCenter + typicalStep * 0.48),
+    ]);
+    const headerCandidate = targetBlock[0];
     const groups: OcrWord[][] = [];
-    for (const w of headerRow.words) {
+    for (const w of headerCandidate.words) {
       const prev = groups[groups.length - 1];
       if (prev && w.x0 - prev[prev.length - 1].x1 < Math.max(26, medianH * 1.4)) {
         prev.push(w);
@@ -587,269 +471,223 @@ async function buildAndRefineTable(
       }
     }
     const centers = groups.map((g) => (g[0].x0 + g[g.length - 1].x1) / 2);
-    baseColBounds = centers.map((c, i) => {
-      const l = i === 0 ? dataMinX : (centers[i - 1] + c) / 2;
-      const r = i === centers.length - 1 ? dataMaxX : (c + centers[i + 1]) / 2;
-      return [l, r];
-    });
+    const minX = hintBox.hintX0 ?? gutterRightX;
+    const maxX = hintBox.hintX1 ?? imgW;
+    colBounds = centers.map((c, i) => [
+      i === 0 ? minX : (centers[i - 1] + c) / 2,
+      i === centers.length - 1 ? maxX : (c + centers[i + 1]) / 2,
+    ]);
   }
 
-  if (baseColBounds.length === 0) return [];
+  if (rowBounds.length === 0 || colBounds.length === 0) {
+    return { cells: [], headerRowIdx: 0, rowIntegrityWarnings: [] };
+  }
 
-  // Split any merged column (e.g. "Post DO | QC Hold") by checking for an internal vertical border
-  // in the data rows below, falling back to the widest middle header word gap
-  const refinedColBounds: Array<[number, number]> = [];
-  for (const [cl, cr] of baseColBounds) {
-    const colWords = headerRow.words.filter((w) => w.xCenter >= cl && w.xCenter <= cr);
-    let splitX: number | null = null;
-    if (colWords.length >= 4 && cr - cl > 130) {
-      // First look for a faint physical vertical border in the data rows inside the middle zone
-      const midMin = cl + (cr - cl) * 0.25;
-      const midMax = cr - (cr - cl) * 0.25;
-      const dataRowXs: number[] = [];
-      for (let dr = headerRowIdx + 1; dr < Math.min(targetBlock.length, headerRowIdx + 4); dr++) {
-        const drInfo = targetBlock[dr];
-        const ctx = cleanCanvas.getContext('2d')!;
-        const y0 = Math.max(0, Math.round(drInfo.yCenter - typicalStep * 0.42));
-        const y1 = Math.min(cleanCanvas.height - 1, Math.round(drInfo.yCenter + typicalStep * 0.42));
-        const rowH = y1 - y0;
-        if (rowH < 8) continue;
-        const d = ctx.getImageData(0, y0, cleanCanvas.width, rowH).data;
-        let bestX = -1;
-        let bestScore = 0;
-        for (let x = Math.round(midMin); x <= Math.round(midMax); x++) {
-          let hits = 0;
-          for (let y = 0; y < rowH; y++) {
-            const lum = d[(y * cleanCanvas.width + x) * 4];
-            const lumL = d[(y * cleanCanvas.width + (x - 3)) * 4];
-            const lumR = d[(y * cleanCanvas.width + (x + 3)) * 4];
-            if (lum < 232 && lumL - lum > 4 && lumR - lum > 4) hits++;
-          }
-          const sc = hits / rowH;
-          if (sc > bestScore) {
-            bestScore = sc;
-            bestX = x;
-          }
-        }
-        if (bestScore >= 0.35 && bestX !== -1) dataRowXs.push(bestX);
-      }
-
-      if (dataRowXs.length >= 1) {
-        splitX = Math.round(dataRowXs.reduce((s, v) => s + v, 0) / dataRowXs.length);
-      } else {
-        let bestGap = 0;
-        let bestPair: [OcrWord, OcrWord] | null = null;
-        for (let i = 0; i < colWords.length - 1; i++) {
-          const gapMid = (colWords[i].x1 + colWords[i + 1].x0) / 2;
-          if (gapMid < midMin || gapMid > midMax) continue;
-          const gap = colWords[i + 1].x0 - colWords[i].x1;
-          if (gap > bestGap) {
-            bestGap = gap;
-            bestPair = [colWords[i], colWords[i + 1]];
-          }
-        }
-        if (bestPair && bestGap >= 8) {
-          splitX = Math.round((bestPair[0].x1 + bestPair[1].x0) / 2);
-        }
-      }
-    }
-    if (splitX !== null) {
-      refinedColBounds.push([cl, splitX], [splitX, cr]);
-    } else {
-      refinedColBounds.push([cl, cr]);
+  // Check if Row 0 is a merged Pivot banner row (fewer internal vertical dividers than body rows)
+  let row0MergedSpanStart: number | null = null;
+  if (rowBounds.length >= 4 && colBounds.length >= 4) {
+    const [r0Top, r0Bot] = rowBounds[0];
+    const r0Borders = detectVerticalGridLines(
+      gridLum,
+      imgW,
+      imgH,
+      r0Top + 3,
+      r0Bot - 3,
+      colBounds[0][0] - 4,
+      colBounds[colBounds.length - 1][1] + 4,
+      0.55
+    );
+    if (r0Borders.length <= 3) {
+      row0MergedSpanStart = colBounds.length >= 2 ? 1 : 0;
     }
   }
-  baseColBounds = refinedColBounds;
 
-  // 5. Re-read every cell individually on the de-moiréd canvas using local row border tracking!
+  // 3. Read EVERY cell via padded high-res cell OCR + Sauvola fallback (ZERO silent substitution)
   await worker.setParameters({
     tessedit_pageseg_mode: PSM.SINGLE_LINE,
     tessedit_char_whitelist: '',
   });
 
-  const matrix: string[][] = [];
-  let prevRowBounds = baseColBounds;
+  type RawCellRead = {
+    value: string;
+    rawConf: number;
+    contrastSnr: number;
+    box: { x0: number; y0: number; x1: number; y1: number };
+    sourceCropDataUrl?: string;
+  };
 
-  for (let r = 0; r < targetBlock.length; r++) {
-    const rowInfo = targetBlock[r];
+  const rawTable: RawCellRead[][] = [];
+
+  for (let r = 0; r < rowBounds.length; r++) {
+    const [rowYTop, rowYBot] = rowBounds[r];
     onProgress?.(
-      `Digitizing row ${r + 1} of ${targetBlock.length}...`,
-      65 + Math.round(((r + 1) / targetBlock.length) * 30)
+      `Extracting & scoring row ${r + 1} of ${rowBounds.length}...`,
+      64 + Math.round(((r + 1) / rowBounds.length) * 32)
     );
 
-    const rowYTop = rowInfo.yCenter - typicalStep * 0.48;
-    const rowYBot = rowInfo.yCenter + typicalStep * 0.48;
+    const rowReads: RawCellRead[] = [];
 
-    // Nudge column borders to local vertical borders on this specific row (handles tilted camera photos!)
-    const localBorders = detectRowVerticalBorders(
-      cleanCanvas,
-      rowYTop,
-      rowYBot,
-      dataMinX - 10,
-      dataMaxX + 10
-    ).filter((bx) => !rowInfo.words.some((w) => bx > w.x0 + 4 && bx < w.x1 - 4));
+    for (let c = 0; c < colBounds.length; c++) {
+      let [cl, cr] = colBounds[c];
+      let skipMergedCell = false;
 
-    const rowBounds: Array<[number, number]> = prevRowBounds.map(([cl, cr]) => {
-      let nL = cl;
-      let nR = cr;
-      if (localBorders.length >= 2) {
-        const matchL = localBorders.find((bx) => Math.abs(bx - cl) < 28);
-        const matchR = localBorders.find((bx) => Math.abs(bx - cr) < 28);
-        if (matchL !== undefined) nL = matchL;
-        if (matchR !== undefined) nR = matchR;
-      }
-      return [nL, nR];
-    });
-    // Prevent slicing trailing characters of a wide text word (e.g. "JAGIR", "MARREDPALLY") at Col 0/Col 1 border
-    for (let c = 0; c < rowBounds.length - 1; c++) {
-      const [cl, cr] = rowBounds[c];
-      const spillingWord = rowInfo.words.find(
-        (w) => w.text.length >= 3 && w.xCenter >= cl && w.xCenter <= cr + 6 && w.x1 > cr - 2
-      );
-      if (spillingWord) {
-        const nextCr = rowBounds[c + 1][1];
-        const safeRight = Math.min(nextCr - 12, spillingWord.x1 + 5);
-        if (safeRight > cr) {
-          rowBounds[c][1] = safeRight;
-          rowBounds[c + 1][0] = safeRight;
-        }
-      }
-    }
-    prevRowBounds = rowBounds;
-
-    const rowCells = new Array<string>(rowBounds.length).fill('');
-    for (let c = 0; c < rowBounds.length; c++) {
-      const [cl, cr] = rowBounds[c];
-
-      // For header rows (r <= headerRowIdx), Pass 1 full-context words are cleaner than tiny shaded crops
-      if (r <= headerRowIdx) {
-        const pass1Text = rowInfo.words
-          .filter((w) => w.xCenter >= cl && w.xCenter <= cr)
-          .map((w) => w.text)
-          .join(' ')
-          .replace(/\s+[vVyY>]$/, '')
-          .trim();
-        if (pass1Text !== '') {
-          rowCells[c] = pass1Text;
-          continue;
+      // Handle Pivot banner Row 0 merged right-side span ("Stage" centered across cols 1..last)
+      if (r === 0 && row0MergedSpanStart !== null) {
+        if (c === row0MergedSpanStart) {
+          cr = colBounds[colBounds.length - 1][1];
+        } else if (c > row0MergedSpanStart) {
+          skipMergedCell = true;
         }
       }
 
-      const cellUrl = cropCleanCellDataUrl(cleanCanvas, cl, cr, rowYTop, rowYBot);
-      if (!cellUrl) {
-        rowCells[c] = '';
+      const box = {
+        x0: Math.max(0, cl),
+        y0: Math.max(0, rowYTop),
+        x1: Math.min(imgW, cr),
+        y1: Math.min(imgH, rowYBot),
+      };
+
+      if (skipMergedCell) {
+        rowReads.push({ value: '', rawConf: 100, contrastSnr: 0, box });
         continue;
       }
 
+      const ink = cleanCellPatchAndCheckEmpty(gridLum, imgW, imgH, cl, cr, rowYTop, rowYBot);
+      if (ink.isEmpty) {
+        rowReads.push({ value: '', rawConf: 100, contrastSnr: ink.contrastSnr, box });
+        continue;
+      }
+
+      const cellUrl = patchLumToOcrDataUrl(ink.patchLum, ink.patchW, ink.patchH, false);
       const cellRes = await worker.recognize(cellUrl);
       let text = (cellRes.data.text || '')
         .replace(/\r?\n/g, ' ')
         .replace(/[|_[\]{}~`]/g, '')
         .replace(/\s+/g, ' ')
         .trim();
+      let conf = Math.round(cellRes.data.confidence || 0);
 
-      if (
-        r > headerRowIdx &&
-        c >= 1 &&
-        (text === '' || /^[^a-zA-Z0-9]+$/.test(text))
-      ) {
-        await worker.setParameters({
-          tessedit_pageseg_mode: PSM.SINGLE_WORD,
-          tessedit_char_whitelist: '0123456789',
-        });
-        const digitRes = await worker.recognize(cellUrl);
-        const dText = (digitRes.data.text || '').replace(/[^0-9]/g, '').trim();
-        if (dText !== '') text = dText;
-        await worker.setParameters({
-          tessedit_pageseg_mode: PSM.SINGLE_LINE,
-          tessedit_char_whitelist: '',
-        });
+      // Retry with Sauvola adaptive thresholding when uncertain or empty
+      if (text === '' || conf < 80 || /^[^a-zA-Z0-9]+$/.test(text)) {
+        const sauvolaUrl = patchLumToOcrDataUrl(ink.patchLum, ink.patchW, ink.patchH, true);
+        const sRes = await worker.recognize(sauvolaUrl);
+        const sText = (sRes.data.text || '')
+          .replace(/\r?\n/g, ' ')
+          .replace(/[|_[\]{}~`]/g, '')
+          .replace(/\s+/g, ' ')
+          .trim();
+        const sConf = Math.round(sRes.data.confidence || 0);
+        if (sText !== '' && (text === '' || /^[^a-zA-Z0-9]+$/.test(text) || sConf > conf)) {
+          text = sText;
+          conf = sConf;
+        }
       }
 
-      if (r <= headerRowIdx) {
+      // Clean trailing Excel filter arrow glyph only on header rows
+      if (r <= 1) {
         text = text.replace(/\s+[vVyY>]$/, '').trim();
       }
 
-      rowCells[c] = text;
+      // Treat pure border-line punctuation artifacts (no alphanumeric characters) as empty
+      if (text !== '' && !/[a-zA-Z0-9]/.test(text)) {
+        text = '';
+        conf = 100;
+      }
+
+      rowReads.push({
+        value: text,
+        rawConf: conf,
+        contrastSnr: ink.contrastSnr,
+        box,
+        sourceCropDataUrl: cropOriginalCellSnippet(origCanvas, box.x0, box.y0, box.x1, box.y1),
+      });
     }
 
-    if (rowCells.some((c) => c !== '')) {
-      matrix.push(rowCells);
+    if (rowReads.some((cell) => cell.value !== '')) {
+      rawTable.push(rowReads);
     }
   }
 
-  // 6. Drop completely empty columns
+  // Drop trailing/interior completely empty columns
   const keepCols: number[] = [];
-  for (let c = 0; c < baseColBounds.length; c++) {
-    if (matrix.some((row) => (row[c] ?? '') !== '')) {
+  for (let c = 0; c < colBounds.length; c++) {
+    if (rawTable.some((row) => (row[c]?.value ?? '') !== '')) {
       keepCols.push(c);
     }
   }
+  const prunedRaw = rawTable.map((row) => keepCols.map((c) => row[c]));
 
-  const pruned = matrix.map((row) => keepCols.map((c) => row[c] ?? ''));
+  // Trim any noise fragment rows below a Grand Total summary footer row (e.g. Excel cursor box)
+  const gtIdx = prunedRaw.findIndex((row) =>
+    /^\s*(grand\s*total|total)\s*$/i.test(row[0]?.value ?? '')
+  );
+  if (gtIdx >= 2 && gtIdx < prunedRaw.length - 1) {
+    prunedRaw.splice(gtIdx + 1);
+  }
 
-  // 7. Detect numeric columns (cols >= 1 where most non-empty cells look numeric or header is a count/total)
-  //    and re-read non-digit artifacts with strict digit whitelist
-  const colCount = keepCols.length;
-  for (let c = 1; c < colCount; c++) {
-    const dataCells = pruned.slice(headerRowIdx + 1).map((r) => r[c] ?? '').filter(Boolean);
-    const numLikeCells = dataCells.filter((v) => /\d/.test(v));
-    const headerLabel = pruned[headerRowIdx]?.[c] ?? '';
-    const isCountHeader = /prep|post|hold|submitted|total|count|qty|amount/i.test(headerLabel);
+  // Drop narrow far-left Excel row-number gutter column if present (e.g. sequential 30..47)
+  if (prunedRaw.length >= 4 && prunedRaw[0].length >= 4) {
+    const col0Sample = prunedRaw.slice(1).map((r) => r[0].value.trim());
+    const col0Box = prunedRaw[0][0].box;
+    const isNarrowLeft = col0Box.x0 < imgW * 0.08 && col0Box.x1 - col0Box.x0 < imgW * 0.06;
+    const numericOrShortCount = col0Sample.filter((v) => /^\d{1,3}$/.test(v) || v.length <= 2).length;
+    if (isNarrowLeft && numericOrShortCount >= col0Sample.length * 0.65) {
+      prunedRaw.forEach((row) => row.shift());
+    }
+  }
+
+  // 4. Identify true column header row (row 0 vs row 1 if row 0 is merged Pivot banner)
+  let headerRowIdx = 0;
+  if (prunedRaw.length >= 3) {
+    const r0NonEmpty = prunedRaw[0].filter((c) => c.value !== '').length;
+    const r1NonEmpty = prunedRaw[1].filter((c) => c.value !== '').length;
+    const r1Joined = prunedRaw[1].map((c) => c.value).join(' ');
     if (
-      dataCells.length >= 1 &&
-      (numLikeCells.length >= dataCells.length * 0.45 || isCountHeader)
+      r1NonEmpty > r0NonEmpty &&
+      /\b(dealer|deal\s*id|issued|opportunity|owner|stage|preparation|post\s*do|submitted|grand\s*total|hold)\b/i.test(
+        r1Joined
+      )
     ) {
-      const origColIdx = keepCols[c];
-      for (let r = headerRowIdx + 1; r < targetBlock.length && r < pruned.length; r++) {
-        const curVal = pruned[r][c] ?? '';
-        if (curVal !== '' && !/^\d+$/.test(curVal)) {
-          const rowInfo = targetBlock[r];
-          const [cl, cr] = prevRowBounds[origColIdx] || baseColBounds[origColIdx];
-          const cellUrl = cropCleanCellDataUrl(
-            cleanCanvas,
-            cl,
-            cr,
-            rowInfo.yCenter - typicalStep * 0.48,
-            rowInfo.yCenter + typicalStep * 0.48
-          );
-          if (cellUrl) {
-            await worker.setParameters({
-              tessedit_pageseg_mode: PSM.SINGLE_WORD,
-              tessedit_char_whitelist: '0123456789',
-            });
-            const dRes = await worker.recognize(cellUrl);
-            const digits = (dRes.data.text || '').replace(/[^0-9]/g, '').trim();
-            pruned[r][c] = digits;
-          } else {
-            pruned[r][c] = '';
-          }
-        }
-      }
+      headerRowIdx = 1;
     }
   }
 
-  // 8. If the last row is a Grand Total row and any numeric column cell is blank,
-  //    fill it deterministically from the vertical column sum above it
-  const lastIdx = pruned.length - 1;
-  if (lastIdx >= headerRowIdx + 2 && /\bgrand\s*total\b/i.test(pruned[lastIdx][0] ?? '')) {
-    for (let c = 1; c < colCount; c++) {
-      if ((pruned[lastIdx][c] ?? '') === '') {
-        let colSum = 0;
-        let hasNums = false;
-        for (let r = headerRowIdx + 1; r < lastIdx; r++) {
-          const val = parseInt(pruned[r][c] ?? '', 10);
-          if (Number.isFinite(val)) {
-            colSum += val;
-            hasNums = true;
-          }
-        }
-        if (hasNums) {
-          pruned[lastIdx][c] = String(colSum);
-        }
-      }
-    }
-  }
+  // 5. Evaluate confidence & string-ID / ambiguity flags against true column headers
+  const headers = (prunedRaw[headerRowIdx] || []).map((c) => c.value);
+  const finalCells: ExtractedCell[][] = prunedRaw.map((row, r) =>
+    row.map((cell, c) => {
+      const headerLabel = headers[c] ?? '';
+      const isIdCol = isIdentifierHeader(headerLabel);
+      const isNumCol = !isIdCol && isStrictNumericHeader(headerLabel);
+      const idColDetected = isIdCol || looksLikeStringIdValue(cell.value);
 
-  return pruned;
+      const evalRes = evaluateCellConfidenceAndFlags({
+        value: cell.value,
+        ocrConfidence: cell.rawConf,
+        contrastSnr: cell.contrastSnr,
+        isIdColumn: idColDetected,
+        isNumericColumn: isNumCol && !idColDetected,
+        isHeaderRow: r <= headerRowIdx,
+      });
+
+      return {
+        value: cell.value,
+        confidence: evalRes.confidence,
+        uncertain: evalRes.uncertain,
+        reasons: evalRes.reasons,
+        isIdColumn: idColDetected,
+        sourceBox: cell.box,
+        sourceCropDataUrl: cell.sourceCropDataUrl,
+      };
+    })
+  );
+
+  // 6. Run sum discrepancy check (flags mismatches without ever inventing or editing data!)
+  const rowIntegrityWarnings = checkTableSumDiscrepancies(finalCells, headerRowIdx);
+
+  return {
+    cells: finalCells,
+    headerRowIdx,
+    rowIntegrityWarnings,
+  };
 }

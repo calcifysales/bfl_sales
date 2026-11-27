@@ -89,7 +89,7 @@ export const SalesforceDashboardTab: React.FC = () => {
       });
       if (result.records.length > 0) {
         setRecords(result.records);
-        setStageView('generated');
+        setStageView(result.records.some((r) => r.needsReview) ? 'editor' : 'generated');
       } else {
         setErrorBanner(
           'No structured table rows detected. Use Paste Table or tap the Edit icon to enter rows.'
@@ -435,7 +435,14 @@ export const SalesforceDashboardTab: React.FC = () => {
                       const pct = calcVasPct(bills, vas);
                       const heat = getVasHeatmapStyle(pct);
                       return (
-                        <tr key={row.id} className="bg-white hover:bg-slate-50/70">
+                        <tr
+                          key={row.id}
+                          className={
+                            row.needsReview
+                              ? 'bg-amber-50/80'
+                              : 'bg-white hover:bg-slate-50/70'
+                          }
+                        >
                           <td className="px-2 py-1.5">
                             <input
                               type="text"
@@ -455,6 +462,11 @@ export const SalesforceDashboardTab: React.FC = () => {
                               }
                               className="w-40 rounded-lg border border-slate-200 px-2 py-1.5 text-slate-800 focus:border-sky-500 focus:outline-none"
                             />
+                            {row.needsReview && row.reviewReason && (
+                              <div className="text-[10px] text-amber-800 mt-0.5">
+                                {row.reviewReason}
+                              </div>
+                            )}
                           </td>
                           {(['cd', 'cdd', 'ifc', 'vs', 'vsd'] as const).map((field) => (
                             <td key={field} className="px-1 py-1.5 text-center">
